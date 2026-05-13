@@ -28,6 +28,8 @@ class MarketData:
     trading_data: pd.DataFrame
     historical_data: pd.DataFrame
     warnings: list[str]
+    historical_start_date: date | None = None
+    historical_end_date: date | None = None
 
 
 @dataclass
@@ -95,7 +97,32 @@ def pick_latest_price(df: pd.DataFrame) -> float | None:
     return None
 
 
-def fetch_stock_data(symbol: str, lookback_days: int = 365) -> MarketData:
+def ensure_date_column(df: pd.DataFrame, fallback_date: date | None = None) -> pd.DataFrame:
+    """Ensure bdshare data has a regular date column for display and export."""
+    if df.empty:
+        return df
+
+    with_date = df.copy()
+    if "date" in with_date.columns:
+        with_date["date"] = pd.to_datetime(with_date["date"], errors="coerce").dt.date
+        return with_date
+
+    if with_date.index.name and str(with_date.index.name).lower() == "date":
+        with_date = with_date.reset_index()
+        with_date["date"] = pd.to_datetime(with_date["date"], errors="coerce").dt.date
+        return with_date
+
+    if fallback_date is not None:
+        with_date.insert(0, "date", fallback_date)
+
+    return with_date
+
+
+def fetch_stock_data(
+    symbol: str,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> MarketData:
     """
     Fetch current and historical DSE trading data using bdshare.
 
@@ -107,6 +134,13 @@ def fetch_stock_data(symbol: str, lookback_days: int = 365) -> MarketData:
     symbol = symbol.strip().upper()
     if not symbol:
         raise ValueError("Please enter a DSE trading symbol.")
+
+    if end_date is None:
+        end_date = date.today()
+    if start_date is None:
+        start_date = end_date - timedelta(days=365)
+    if start_date > end_date:
+        raise ValueError("Historical start date cannot be after the end date.")
 
     try:
         from bdshare import get_current_trade_data, get_hist_data
@@ -127,6 +161,7 @@ def fetch_stock_data(symbol: str, lookback_days: int = 365) -> MarketData:
         exact = trading_df[trading_df["symbol"].astype(str).str.upper() == symbol]
         if not exact.empty:
             trading_df = exact
+    trading_df = ensure_date_column(trading_df, end_date)
 
     latest_price = pick_latest_price(trading_df)
     if latest_price is None:
@@ -134,12 +169,11 @@ def fetch_stock_data(symbol: str, lookback_days: int = 365) -> MarketData:
             "bdshare returned trading data, but no usable latest market price was found."
         )
 
-    end = date.today()
-    start = end - timedelta(days=lookback_days)
     try:
         historical_df = normalize_columns(
-            get_hist_data(start.isoformat(), end.isoformat(), symbol)
+            get_hist_data(start_date.isoformat(), end_date.isoformat(), symbol)
         )
+        historical_df = ensure_date_column(historical_df)
     except Exception as exc:
         historical_df = pd.DataFrame()
         warnings.append(f"Historical price data could not be fetched: {exc}")
@@ -150,6 +184,8 @@ def fetch_stock_data(symbol: str, lookback_days: int = 365) -> MarketData:
         trading_data=trading_df,
         historical_data=historical_df,
         warnings=warnings,
+        historical_start_date=start_date,
+        historical_end_date=end_date,
     )
 
 
@@ -924,14 +960,49 @@ def render_market_data(market_data: MarketData | None) -> None:
         return
 
     st.metric("Latest market price", format_currency(market_data.latest_price))
+    if market_data.historical_start_date and market_data.historical_end_date:
+        st.caption(
+            "Historical range: "
+            f"{market_data.historical_start_date.isoformat()} to "
+            f"{market_data.historical_end_date.isoformat()}"
+        )
 
     for warning in market_data.warnings:
         st.warning(warning)
+
+    export_cols = st.columns(2)
+    if not market_data.trading_data.empty:
+        export_cols[0].download_button(
+            "Export current bdshare data",
+            data=market_data.trading_data.to_csv(index=False).encode("utf-8"),
+            file_name=f"{market_data.symbol}_bdshare_current.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    if not market_data.historical_data.empty:
+        start_label = (
+            market_data.historical_start_date.isoformat()
+            if market_data.historical_start_date
+            else "start"
+        )
+        end_label = (
+            market_data.historical_end_date.isoformat()
+            if market_data.historical_end_date
+            else "end"
+        )
+        export_cols[1].download_button(
+            "Export historical bdshare data",
+            data=market_data.historical_data.to_csv(index=False).encode("utf-8"),
+            file_name=f"{market_data.symbol}_bdshare_historical_{start_label}_to_{end_label}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
     if not market_data.trading_data.empty:
         display_cols = [
             col
             for col in [
+                "date",
                 "symbol",
                 "ltp",
                 "high",
@@ -1146,7 +1217,7 @@ def render_methodology_notes() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="DSE Reverse DCF", layout="wide")
+    st.set_page_config(page_title="DSE Insight", layout="wide")
     inject_custom_css()
     render_page_header()
 
@@ -1182,13 +1253,19 @@ def main() -> None:
             ).upper().strip()
 
             with st.expander("Market data options", expanded=False):
-                lookback_days = st.number_input(
-                    "Historical lookback days",
-                    min_value=30,
-                    max_value=3650,
-                    value=365,
-                    step=30,
-                    help="Used only for bdshare historical trading data display.",
+                default_end_date = date.today()
+                default_start_date = default_end_date - timedelta(days=365)
+                historical_start_date = st.date_input(
+                    "Historical start date",
+                    value=default_start_date,
+                    max_value=default_end_date,
+                    help="Start date for bdshare historical price data.",
+                )
+                historical_end_date = st.date_input(
+                    "Historical end date",
+                    value=default_end_date,
+                    max_value=default_end_date,
+                    help="End date for bdshare historical price data.",
                 )
 
             if st.button("Fetch DSE Data", type="primary", use_container_width=True):
@@ -1196,7 +1273,8 @@ def main() -> None:
                     with st.spinner("Fetching market data from bdshare..."):
                         st.session_state.market_data = fetch_stock_data(
                             ticker,
-                            int(lookback_days),
+                            historical_start_date,
+                            historical_end_date,
                         )
                     if st.session_state.market_data.latest_price is not None:
                         st.session_state.market_price_input = float(
