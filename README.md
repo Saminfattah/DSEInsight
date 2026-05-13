@@ -12,18 +12,18 @@ The application is built with a professional Streamlit dashboard interface where
 This project is intended for educational, analytical, and preliminary investment research purposes. It is not financial advice, and valuation results should be interpreted carefully alongside company fundamentals, industry conditions, and market risks.
 
 ## Key Features
-Reverse DCF model for DSE-listed companies
-Implied growth rate calculation based on current market price
-Data collection using the bdshare Python library
-P/E relative valuation using scraped data from dsebd.org
-Peer company selection by industry
-Average, median, trimmed average, and custom P/E valuation methods
-Manual override for EPS, market price, and valuation assumptions
-Sensitivity analysis for valuation assumptions
-Professional Streamlit dashboard UI
-Input validation and error handling
-Peer comparison table and valuation charts
-Beginner-friendly structure for finance students and analysts
+* Reverse DCF model for DSE-listed companies
+* Implied growth rate calculation based on current market price
+* Data collection using the bdshare Python library
+* P/E relative valuation using scraped data from dsebd.org
+* Peer company selection by industry
+* Average, median, trimmed average, and custom P/E valuation methods
+* Manual override for EPS, market price, and valuation assumptions
+* Sensitivity analysis for valuation assumptions
+* Professional Streamlit dashboard UI
+* Input validation and error handling
+* Peer comparison table and valuation charts
+* Beginner-friendly structure for finance students and analysts
 
 ## Purpose
 The main purpose of this project is to make equity valuation more accessible for DSE-listed companies by combining automated data collection, manual financial assumptions, and interactive valuation models in one simple dashboard. It helps users understand what growth expectations are implied in a stock’s current price and how the stock compares with similar companies based on market valuation multiples.
