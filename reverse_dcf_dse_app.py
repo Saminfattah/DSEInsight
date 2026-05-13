@@ -2452,7 +2452,7 @@ def main() -> None:
         render_reverse_dcf_page()
     else:
         render_page_header(
-            "DSE P/E Relative Valuation",
+            "Dhaka Stock Exchange P/E Relative Valuation",
             "Scrape official DSE company pages, compare selected peer P/E multiples, and estimate market-relative fair value.",
         )
         render_pe_relative_valuation_page()
