@@ -14,10 +14,14 @@ from io import BytesIO
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
+import html
+import re
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
+from bs4 import BeautifulSoup
 import streamlit as st
 
 
@@ -41,6 +45,21 @@ class DCFResult:
     pv_terminal_value: float
     terminal_value: float
     projected_cash_flows: pd.DataFrame
+
+
+@dataclass
+class DSECompanyData:
+    ticker: str
+    url: str
+    company_name: str | None = None
+    sector: str | None = None
+    last_traded_price: float | None = None
+    audited_pe: float | None = None
+    basic_eps: float | None = None
+    market_cap_mn: float | None = None
+    paid_up_capital_mn: float | None = None
+    total_securities: float | None = None
+    error: str | None = None
 
 
 def to_float(value: Any) -> float | None:
@@ -587,6 +606,378 @@ def build_excel_export(
         return None
 
 
+DSE_BASE_URL = "https://www.dsebd.org/displayCompany.php?name="
+DSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
+KNOWN_SECTOR_PEER_SEEDS = {
+    "telecommunication": ["GP", "ROBI", "BSCPLC"],
+    "pharmaceuticals & chemicals": [
+        "SQURPHARMA",
+        "BXPHARMA",
+        "RENATA",
+        "IBNSINA",
+        "BEACONPHAR",
+        "ACMELAB",
+        "ORIONPHARM",
+        "NAVANAPHAR",
+    ],
+    "bank": [
+        "BRACBANK",
+        "CITYBANK",
+        "EBL",
+        "DUTCHBANGL",
+        "PRIMEBANK",
+        "PUBALIBANK",
+        "ISLAMIBANK",
+        "UCB",
+        "MTB",
+    ],
+    "cement": ["LHB", "CROWNCEMNT", "PREMIERCEM", "CONFIDCEM", "HEIDELBCEM", "MEGHNACEM"],
+    "fuel & power": ["UPGDCL", "SUMITPOWER", "KPCL", "DOREENPWR", "DESCO", "TITASGAS", "POWERGRID"],
+    "food & allied": ["OLYMPIC", "BATBC", "UNILEVERCL", "LOVELLO", "RDFOOD", "FINEFOODS"],
+    "textile": ["ENVOYTEX", "SQUARETEXT", "SAIHAMCOT", "SAIHAMTEX", "MATINSPINN", "PRIMETEX"],
+    "engineering": ["BSRMLTD", "BSRMSTEEL", "GPHISPAT", "WALTONHIL", "SINGERBD", "RANFOUNDRY"],
+    "insurance": ["GREENDELT", "PIONEERINS", "RELIANCINS", "PRAGATIINS", "CENTRALINS", "EASTERNINS"],
+}
+
+
+def build_dse_company_url(ticker: str) -> str:
+    return f"{DSE_BASE_URL}{ticker.strip().upper()}"
+
+
+def clean_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value).replace("\xa0", " ")).strip()
+
+
+def parse_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = clean_text(value)
+    if text in {"", "-", "N/A", "n/a", "nan", "None"}:
+        return None
+    match = re.search(r"-?\d+(?:,\d{3})*(?:\.\d+)?|-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    return to_float(match.group(0))
+
+
+def extract_value_after_label(text: str, label: str) -> str | None:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    target = clean_text(label).lower()
+    for index, line in enumerate(lines):
+        if clean_text(line).lower() == target and index + 1 < len(lines):
+            return lines[index + 1]
+    for index, line in enumerate(lines):
+        if target in clean_text(line).lower() and index + 1 < len(lines):
+            return lines[index + 1]
+    return None
+
+
+def extract_audited_pe(tables: list[pd.DataFrame]) -> float | None:
+    pe_tables = []
+    for table in tables:
+        table_text = clean_text(table.to_string()).lower()
+        if "current p/e ratio using basic eps" in table_text:
+            pe_tables.append(table)
+
+    if not pe_tables:
+        return None
+
+    audited_table = pe_tables[-1]
+    for _, row in audited_table.iterrows():
+        row_values = [clean_text(value) for value in row.tolist()]
+        if row_values and "current p/e ratio using basic eps" in row_values[0].lower():
+            numeric_values = [parse_number(value) for value in row_values[1:]]
+            numeric_values = [value for value in numeric_values if value is not None]
+            return numeric_values[-1] if numeric_values else None
+    return None
+
+
+def extract_basic_eps(tables: list[pd.DataFrame], last_traded_price: float | None, audited_pe: float | None) -> float | None:
+    for table in tables:
+        table_text = clean_text(table.to_string()).lower()
+        if "financial performance as per audited" not in table_text and "eps - continuing operations" not in table_text:
+            continue
+        data_rows = table.iloc[3:] if len(table) > 3 else table
+        for _, row in data_rows.sort_index(ascending=False).iterrows():
+            values = row.tolist()
+            year = parse_number(values[0] if values else None)
+            if year is None:
+                continue
+            # DSE audited financial table commonly stores EPS continuing ops basic original in column 5.
+            for idx in [5, 6, 2, 3]:
+                if idx < len(values):
+                    eps = parse_number(values[idx])
+                    if eps is not None:
+                        return eps
+
+    if last_traded_price and audited_pe and audited_pe > 0:
+        return last_traded_price / audited_pe
+    return None
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def scrape_dse_company_data(ticker: str) -> DSECompanyData:
+    symbol = ticker.strip().upper()
+    url = build_dse_company_url(symbol)
+    if not symbol:
+        return DSECompanyData(ticker=symbol, url=url, error="Ticker is empty.")
+
+    try:
+        response = requests.get(url, headers=DSE_HEADERS, timeout=20)
+        response.raise_for_status()
+    except Exception as exc:
+        return DSECompanyData(ticker=symbol, url=url, error=f"DSE request failed: {exc}")
+
+    try:
+        soup = BeautifulSoup(response.text, "html.parser")
+        page_text = soup.get_text("\n", strip=True)
+        tables = pd.read_html(BytesIO(response.content))
+    except Exception as exc:
+        return DSECompanyData(ticker=symbol, url=url, error=f"DSE page parse failed: {exc}")
+
+    company_name = extract_value_after_label(page_text, "Company Name:")
+    trading_code = extract_value_after_label(page_text, "Trading Code:") or symbol
+    sector = extract_value_after_label(page_text, "Sector")
+    last_price = parse_number(extract_value_after_label(page_text, "Last Trading Price"))
+    market_cap = parse_number(extract_value_after_label(page_text, "Market Capitalization (mn)"))
+    paid_up = parse_number(extract_value_after_label(page_text, "Paid-up Capital (mn)"))
+    securities = parse_number(extract_value_after_label(page_text, "Total No. of Outstanding Securities"))
+    audited_pe = extract_audited_pe(tables)
+    basic_eps = extract_basic_eps(tables, last_price, audited_pe)
+
+    if company_name is None and audited_pe is None and sector is None:
+        return DSECompanyData(
+            ticker=symbol,
+            url=url,
+            error="Could not find company data on the DSE page. Check the ticker.",
+        )
+
+    return DSECompanyData(
+        ticker=clean_text(trading_code).upper(),
+        url=url,
+        company_name=company_name,
+        sector=sector,
+        last_traded_price=last_price,
+        audited_pe=audited_pe,
+        basic_eps=basic_eps,
+        market_cap_mn=market_cap,
+        paid_up_capital_mn=paid_up,
+        total_securities=securities,
+    )
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def get_dse_symbol_universe(seed_ticker: str = "GP") -> list[str]:
+    data = scrape_dse_company_data(seed_ticker)
+    if data.error:
+        return []
+    try:
+        html = requests.get(build_dse_company_url(seed_ticker), headers=DSE_HEADERS, timeout=20).text
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    candidates: set[str] = set()
+    for link in soup.find_all("a", href=True):
+        href = link["href"]
+        match = re.search(r"displayCompany\.php\?name=([A-Z0-9&\-.()]+)", href, flags=re.I)
+        if match:
+            candidates.add(match.group(1).upper())
+    if not candidates:
+        text = soup.get_text(" ", strip=True)
+        candidates.update(re.findall(r"\b[A-Z][A-Z0-9&().-]{2,14}\b(?=\s+\d+\.\d{1,2})", text))
+    return sorted(candidates)
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def find_same_sector_peers(target_ticker: str, target_sector: str | None, max_scan: int = 320) -> list[str]:
+    if not target_sector:
+        return []
+    target = target_ticker.upper()
+    sector_key = clean_text(target_sector).lower()
+    seeded = [
+        symbol
+        for key, symbols in KNOWN_SECTOR_PEER_SEEDS.items()
+        if key in sector_key or sector_key in key
+        for symbol in symbols
+    ]
+    if seeded:
+        peers = []
+        for symbol in sorted(set(seeded)):
+            if symbol == target:
+                continue
+            company = scrape_dse_company_data(symbol)
+            if company.error:
+                continue
+            if clean_text(company.sector).lower() == sector_key:
+                peers.append(company.ticker)
+        return sorted(set(peers))
+
+    universe = [symbol for symbol in get_dse_symbol_universe(target) if symbol != target]
+    peers: list[str] = []
+    for symbol in universe[:max_scan]:
+        company = scrape_dse_company_data(symbol)
+        if company.error:
+            continue
+        if clean_text(company.sector).lower() == clean_text(target_sector).lower():
+            peers.append(company.ticker)
+    return sorted(set(peers))
+
+
+def company_data_to_dict(company: DSECompanyData) -> dict[str, Any]:
+    return {
+        "Ticker": company.ticker,
+        "Company Name": company.company_name,
+        "Sector": company.sector,
+        "Market Price": company.last_traded_price,
+        "Audited P/E": company.audited_pe,
+        "Basic EPS": company.basic_eps,
+        "Market Cap (mn)": company.market_cap_mn,
+        "Error": company.error,
+        "URL": company.url,
+    }
+
+
+def scrape_peer_company_data(peer_tickers: list[str]) -> pd.DataFrame:
+    rows = [company_data_to_dict(scrape_dse_company_data(ticker)) for ticker in peer_tickers]
+    return pd.DataFrame(rows)
+
+
+def clean_peer_pe_data(peer_df: pd.DataFrame, outlier_threshold: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if peer_df.empty:
+        return peer_df.copy(), peer_df.copy()
+
+    cleaned = peer_df.copy()
+    cleaned["Audited P/E"] = pd.to_numeric(cleaned["Audited P/E"], errors="coerce")
+    cleaned["Basic EPS"] = pd.to_numeric(cleaned["Basic EPS"], errors="coerce")
+    cleaned["Market Price"] = pd.to_numeric(cleaned["Market Price"], errors="coerce")
+    reasons = []
+    for _, row in cleaned.iterrows():
+        reason = ""
+        if row.get("Error"):
+            reason = row["Error"]
+        elif pd.isna(row["Audited P/E"]):
+            reason = "Missing or non-numeric P/E"
+        elif row["Audited P/E"] <= 0:
+            reason = "Zero or negative P/E"
+        elif row["Audited P/E"] > outlier_threshold:
+            reason = f"P/E above outlier threshold ({outlier_threshold:g})"
+        reasons.append(reason)
+    cleaned["Exclusion Reason"] = reasons
+
+    included = cleaned[cleaned["Exclusion Reason"] == ""].copy()
+    excluded = cleaned[cleaned["Exclusion Reason"] != ""].copy()
+    return included, excluded
+
+
+def calculate_peer_pe_statistics(valid_peer_df: pd.DataFrame) -> dict[str, float | None]:
+    pe_values = pd.to_numeric(valid_peer_df.get("Audited P/E", pd.Series(dtype=float)), errors="coerce").dropna()
+    if pe_values.empty:
+        return {
+            "average": None,
+            "median": None,
+            "minimum": None,
+            "maximum": None,
+            "trimmed_average": None,
+            "count": 0,
+        }
+    trimmed = pe_values.sort_values()
+    if len(trimmed) >= 5:
+        trim_count = max(1, int(len(trimmed) * 0.10))
+        trimmed = trimmed.iloc[trim_count:-trim_count] if len(trimmed) > trim_count * 2 else trimmed
+    return {
+        "average": float(pe_values.mean()),
+        "median": float(pe_values.median()),
+        "minimum": float(pe_values.min()),
+        "maximum": float(pe_values.max()),
+        "trimmed_average": float(trimmed.mean()),
+        "count": int(len(pe_values)),
+    }
+
+
+def run_relative_valuation(
+    *,
+    target_eps: float,
+    current_price: float,
+    peer_stats: dict[str, float | None],
+    selected_multiple: str,
+    custom_pe: float,
+) -> dict[str, float | None]:
+    multiple_map = {
+        "Average P/E": peer_stats.get("average"),
+        "Median P/E": peer_stats.get("median"),
+        "Trimmed average P/E": peer_stats.get("trimmed_average"),
+        "Custom P/E": custom_pe,
+    }
+    selected_pe = multiple_map.get(selected_multiple)
+    implied_value = target_eps * selected_pe if target_eps is not None and selected_pe is not None else None
+    upside = (
+        (implied_value - current_price) / current_price
+        if implied_value is not None and current_price and current_price > 0
+        else None
+    )
+    return {
+        "selected_pe": selected_pe,
+        "implied_value": implied_value,
+        "upside": upside,
+    }
+
+
+def build_peer_pe_chart(valid_peer_df: pd.DataFrame, target_company: DSECompanyData, peer_stats: dict[str, float | None]) -> go.Figure:
+    chart_df = valid_peer_df[["Ticker", "Audited P/E"]].copy() if not valid_peer_df.empty else pd.DataFrame(columns=["Ticker", "Audited P/E"])
+    if target_company.audited_pe is not None:
+        chart_df = pd.concat(
+            [
+                pd.DataFrame([{"Ticker": f"{target_company.ticker} (Target)", "Audited P/E": target_company.audited_pe}]),
+                chart_df,
+            ],
+            ignore_index=True,
+        )
+    colors = ["#fbbf24" if "Target" in ticker else "#14b8a6" for ticker in chart_df["Ticker"]]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=chart_df["Ticker"],
+            y=chart_df["Audited P/E"],
+            marker_color=colors,
+            hovertemplate="%{x}<br>P/E: %{y:.2f}x<extra></extra>",
+        )
+    )
+    if peer_stats.get("average") is not None:
+        fig.add_hline(y=peer_stats["average"], line_color="#60a5fa", line_dash="dash", annotation_text="Peer average")
+    if peer_stats.get("median") is not None:
+        fig.add_hline(y=peer_stats["median"], line_color="#fbbf24", line_dash="dot", annotation_text="Peer median")
+    fig.update_layout(
+        height=360,
+        margin={"l": 10, "r": 10, "t": 10, "b": 10},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#0f172a",
+        font={"color": "#dbe7f5"},
+        xaxis_title="Company",
+        yaxis_title="Audited P/E",
+    )
+    fig.update_xaxes(color="#dbe7f5")
+    fig.update_yaxes(color="#dbe7f5", gridcolor="#263244")
+    return fig
+
+
+def build_pe_sensitivity_table(target_eps: float) -> pd.DataFrame:
+    eps_cases = [target_eps * 0.90, target_eps, target_eps * 1.10]
+    pe_cases = [8, 10, 12, 15, 20, 25]
+    rows = []
+    for eps in eps_cases:
+        row = {"EPS Case": f"{eps:.2f}"}
+        for pe in pe_cases:
+            row[f"{pe}x P/E"] = eps * pe
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def inject_custom_css() -> None:
     """Apply a dark finance-dashboard look."""
     st.markdown(
@@ -604,6 +995,80 @@ def inject_custom_css() -> None:
             [data-testid="stHeader"] {
                 background: rgba(11, 17, 29, 0.88);
                 backdrop-filter: blur(10px);
+            }
+            section[data-testid="stSidebar"] {
+                background: linear-gradient(180deg, #07111f 0%, #0b1220 52%, #0d1828 100%);
+                border-right: 1px solid #243044;
+            }
+            section[data-testid="stSidebar"] > div {
+                padding-top: 1.2rem;
+            }
+            .nav-brand {
+                background: linear-gradient(135deg, rgba(20, 184, 166, 0.20), rgba(37, 99, 235, 0.12));
+                border: 1px solid rgba(94, 234, 212, 0.22);
+                border-radius: 8px;
+                padding: 16px;
+                margin-bottom: 14px;
+                box-shadow: 0 14px 34px rgba(0, 0, 0, 0.24);
+            }
+            .nav-kicker {
+                color: #5eead4;
+                font-size: 0.72rem;
+                font-weight: 800;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                margin-bottom: 5px;
+            }
+            .nav-title {
+                color: #f8fafc;
+                font-size: 1.18rem;
+                font-weight: 850;
+                line-height: 1.15;
+                margin-bottom: 6px;
+            }
+            .nav-subtitle,
+            .nav-note {
+                color: #a9bad0;
+                font-size: 0.84rem;
+                line-height: 1.45;
+            }
+            .nav-note {
+                border: 1px solid #243044;
+                border-radius: 8px;
+                padding: 12px;
+                margin-top: 12px;
+                background: rgba(15, 23, 42, 0.78);
+            }
+            section[data-testid="stSidebar"] [data-testid="stRadio"] {
+                background: rgba(16, 24, 39, 0.92);
+                border: 1px solid #243044;
+                border-radius: 8px;
+                padding: 8px;
+            }
+            section[data-testid="stSidebar"] div[role="radiogroup"] {
+                gap: 7px;
+            }
+            section[data-testid="stSidebar"] div[role="radiogroup"] label {
+                min-height: 46px;
+                padding: 10px 12px;
+                border: 1px solid transparent;
+                border-radius: 7px;
+                background: #0f172a;
+                transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
+            }
+            section[data-testid="stSidebar"] div[role="radiogroup"] label:hover {
+                background: #13243a;
+                border-color: rgba(94, 234, 212, 0.42);
+                transform: translateY(-1px);
+            }
+            section[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) {
+                background: linear-gradient(135deg, rgba(20, 184, 166, 0.28), rgba(37, 99, 235, 0.16));
+                border-color: rgba(94, 234, 212, 0.66);
+                box-shadow: inset 3px 0 0 #5eead4;
+            }
+            section[data-testid="stSidebar"] div[role="radiogroup"] label p {
+                color: #e7edf7 !important;
+                font-weight: 750;
             }
             .hero {
                 background: linear-gradient(135deg, #13243a 0%, #0f766e 55%, #1f7a4d 100%);
@@ -717,6 +1182,112 @@ def inject_custom_css() -> None:
                 font-weight: 700;
                 margin-top: 8px;
             }
+            .target-company-card {
+                background:
+                    radial-gradient(circle at top right, rgba(94, 234, 212, 0.18), transparent 30%),
+                    linear-gradient(135deg, #162235 0%, #101827 100%);
+                border: 1px solid rgba(94, 234, 212, 0.30);
+                border-radius: 8px;
+                padding: 20px 20px 18px;
+                margin-bottom: 14px;
+                box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+            }
+            .target-topline {
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 14px;
+                flex-wrap: wrap;
+            }
+            .target-company-name {
+                color: #f8fafc;
+                font-size: 1.52rem;
+                line-height: 1.16;
+                font-weight: 850;
+                margin-bottom: 8px;
+            }
+            .target-company-meta {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+                align-items: center;
+            }
+            .target-badge,
+            .target-sector {
+                border-radius: 7px;
+                padding: 6px 9px;
+                font-size: 0.80rem;
+                font-weight: 800;
+                letter-spacing: 0.01em;
+            }
+            .target-badge {
+                background: rgba(94, 234, 212, 0.15);
+                color: #99f6e4;
+                border: 1px solid rgba(94, 234, 212, 0.32);
+            }
+            .target-sector {
+                background: rgba(148, 163, 184, 0.12);
+                color: #dbe7f5;
+                border: 1px solid rgba(148, 163, 184, 0.22);
+            }
+            .target-link {
+                color: #7dd3fc;
+                text-decoration: none;
+                font-size: 0.86rem;
+                font-weight: 800;
+                border: 1px solid rgba(125, 211, 252, 0.26);
+                border-radius: 7px;
+                padding: 8px 10px;
+                background: rgba(14, 165, 233, 0.08);
+            }
+            .target-company-caption {
+                color: #a9bad0;
+                font-size: 0.88rem;
+                line-height: 1.45;
+                margin-top: 14px;
+                max-width: 820px;
+            }
+            .target-metric-grid {
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 12px;
+                margin-bottom: 18px;
+            }
+            .target-mini-card {
+                background: linear-gradient(180deg, #162235 0%, #101827 100%);
+                border: 1px solid #2d3a50;
+                border-radius: 8px;
+                padding: 15px 16px;
+                min-height: 106px;
+                box-shadow: 0 12px 30px rgba(0, 0, 0, 0.30);
+            }
+            .target-mini-card.primary {
+                border-color: rgba(94, 234, 212, 0.42);
+                background: linear-gradient(180deg, rgba(20, 184, 166, 0.17), #101827 100%);
+            }
+            .target-mini-label {
+                color: #9fb2c8;
+                font-size: 0.79rem;
+                font-weight: 800;
+                margin-bottom: 9px;
+            }
+            .target-mini-value {
+                color: #f8fafc;
+                font-size: 1.28rem;
+                font-weight: 850;
+                line-height: 1.18;
+                overflow-wrap: break-word;
+            }
+            .target-mini-card.primary .target-mini-value {
+                color: #5eead4;
+                font-size: 1.50rem;
+                white-space: nowrap;
+            }
+            @media (max-width: 1100px) {
+                .target-metric-grid {
+                    grid-template-columns: repeat(2, minmax(0, 1fr));
+                }
+            }
             .empty-state {
                 border: 1px dashed #475569;
                 border-radius: 8px;
@@ -811,6 +1382,10 @@ def format_percent(value: float | None) -> str:
     return f"{value:.2%}"
 
 
+def escape_html(value: Any) -> str:
+    return html.escape("" if value is None else str(value))
+
+
 def style_dark_dataframe(styler: pd.io.formats.style.Styler) -> pd.io.formats.style.Styler:
     return (
         styler.set_table_styles(
@@ -857,14 +1432,13 @@ def render_value_card(
     )
 
 
-def render_page_header() -> None:
+def render_page_header(title: str, subtitle: str) -> None:
     st.markdown(
-        """
+        f"""
         <div class="hero">
-            <h1>Dhaka Stock Exchange Reverse DCF</h1>
+            <h1>{title}</h1>
             <p>
-                A clean valuation dashboard for estimating the free-cash-flow
-                growth rate already implied by a DSE-listed company's market price.
+                {subtitle}
             </p>
         </div>
         """,
@@ -1216,11 +1790,7 @@ def render_methodology_notes() -> None:
         )
 
 
-def main() -> None:
-    st.set_page_config(page_title="DSE Insight", layout="wide")
-    inject_custom_css()
-    render_page_header()
-
+def render_reverse_dcf_page() -> None:
     if "market_data" not in st.session_state:
         st.session_state.market_data = None
     if "market_price_input" not in st.session_state:
@@ -1459,6 +2029,433 @@ def main() -> None:
                 export_assumptions=st.session_state.export_assumptions,
             )
             render_methodology_notes()
+
+
+def render_company_summary(company: DSECompanyData | None) -> None:
+    st.markdown('<div class="panel-title">Target Company</div>', unsafe_allow_html=True)
+    if company is None:
+        st.markdown(
+            """
+            <div class="empty-state">
+                Enter a DSE ticker and fetch official DSE company data to begin relative valuation.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+    if company.error:
+        st.error(company.error)
+        st.caption(company.url)
+        return
+
+    company_name = escape_html(company.company_name or "Company name unavailable")
+    ticker = escape_html(company.ticker)
+    sector = escape_html(company.sector or "Sector unavailable")
+    company_url = escape_html(company.url)
+    market_cap_value = None if company.market_cap_mn is None else company.market_cap_mn * 1_000_000
+    market_cap_display = "N/A"
+    if market_cap_value is not None and not pd.isna(market_cap_value):
+        if abs(market_cap_value) >= 10_000_000:
+            market_cap_display = f"BDT {market_cap_value / 10_000_000:,.0f} crore"
+        else:
+            market_cap_display = format_bdt_compact(market_cap_value)
+    audited_pe_display = "N/A" if company.audited_pe is None else f"{company.audited_pe:.2f}x"
+    eps_display = "N/A" if company.basic_eps is None else f"BDT {company.basic_eps:,.2f}"
+    price_display = format_currency(company.last_traded_price)
+
+    st.markdown(
+        f"""
+        <div class="target-company-card">
+            <div class="target-topline">
+                <div>
+                    <div class="target-company-name">{company_name}</div>
+                    <div class="target-company-meta">
+                        <span class="target-badge">{ticker}</span>
+                        <span class="target-sector">{sector}</span>
+                    </div>
+                </div>
+                <a class="target-link" href="{company_url}" target="_blank">Official DSE profile</a>
+            </div>
+            <div class="target-company-caption">
+                This is the valuation anchor for the P/E comparison. Review the audited P/E and EPS quality
+                before relying on peer multiples, especially when earnings are unusual or sector peers are limited.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"""
+        <div class="target-metric-grid">
+            <div class="target-mini-card primary">
+                <div class="target-mini-label">Audited P/E</div>
+                <div class="target-mini-value">{escape_html(audited_pe_display)}</div>
+            </div>
+            <div class="target-mini-card">
+                <div class="target-mini-label">Basic EPS</div>
+                <div class="target-mini-value">{escape_html(eps_display)}</div>
+            </div>
+            <div class="target-mini-card">
+                <div class="target-mini-label">Last traded price</div>
+                <div class="target-mini-value">{escape_html(price_display)}</div>
+            </div>
+            <div class="target-mini-card">
+                <div class="target-mini-label">Market cap</div>
+                <div class="target-mini-value">{escape_html(market_cap_display)}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_relative_valuation_dashboard(
+    *,
+    target_company: DSECompanyData | None,
+    valid_peers: pd.DataFrame | None,
+    excluded_peers: pd.DataFrame | None,
+    peer_stats: dict[str, float | None] | None,
+    valuation: dict[str, float | None] | None,
+    target_eps: float | None,
+    target_price: float | None,
+    selected_multiple: str | None,
+) -> None:
+    render_company_summary(target_company)
+    st.divider()
+
+    if target_company is None or target_company.error:
+        return
+
+    if valuation is None or peer_stats is None:
+        st.markdown(
+            """
+            <div class="empty-state">
+                Select peers and run relative valuation to see peer statistics, charts, and fair value estimates.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    if peer_stats.get("count", 0) < 3:
+        st.warning("Too few valid peer companies. Relative valuation may be unreliable.")
+    if target_eps is not None and target_eps <= 0:
+        st.warning("Target EPS is zero or negative. P/E valuation is usually misleading for loss-making companies.")
+
+    st.markdown('<div class="panel-title">Relative Valuation Output</div>', unsafe_allow_html=True)
+    output_cols = st.columns(4)
+    with output_cols[0]:
+        render_value_card("Peer average P/E", "N/A" if peer_stats["average"] is None else f"{peer_stats['average']:.2f}x")
+    with output_cols[1]:
+        render_value_card("Peer median P/E", "N/A" if peer_stats["median"] is None else f"{peer_stats['median']:.2f}x", primary=True)
+    with output_cols[2]:
+        render_value_card("Selected multiple", "N/A" if valuation["selected_pe"] is None else f"{valuation['selected_pe']:.2f}x")
+    with output_cols[3]:
+        render_value_card("Implied fair value", format_currency(valuation["implied_value"]))
+
+    upside_text = "N/A" if valuation["upside"] is None else f"{valuation['upside']:.2%}"
+    st.markdown(
+        f"""
+        <div class="insight-note">
+            Relative valuation estimates what the target may be worth if the market values it similarly
+            to the selected peer group. Using <b>{selected_multiple}</b>, the implied upside/downside is
+            <b>{upside_text}</b>. This is not intrinsic value; it depends heavily on peer selection and EPS quality.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    stat_cols = st.columns(4)
+    stat_cols[0].metric("Peer count", int(peer_stats["count"]))
+    stat_cols[1].metric("Min P/E", "N/A" if peer_stats["minimum"] is None else f"{peer_stats['minimum']:.2f}x")
+    stat_cols[2].metric("Max P/E", "N/A" if peer_stats["maximum"] is None else f"{peer_stats['maximum']:.2f}x")
+    stat_cols[3].metric("Trimmed avg P/E", "N/A" if peer_stats["trimmed_average"] is None else f"{peer_stats['trimmed_average']:.2f}x")
+
+    st.divider()
+    st.subheader("Peer P/E Comparison")
+    if valid_peers is not None and not valid_peers.empty:
+        st.plotly_chart(
+            build_peer_pe_chart(valid_peers, target_company, peer_stats),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
+        st.dataframe(
+            style_dark_dataframe(
+                valid_peers.style.format(
+                    {
+                        "Market Price": "BDT {:,.2f}",
+                        "Audited P/E": "{:.2f}x",
+                        "Basic EPS": "BDT {:,.2f}",
+                        "Market Cap (mn)": "{:,.2f}",
+                    },
+                    na_rep="N/A",
+                )
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if excluded_peers is not None and not excluded_peers.empty:
+        with st.expander("Excluded peers and reasons"):
+            st.dataframe(
+                style_dark_dataframe(
+                    excluded_peers.style.format(
+                        {
+                            "Market Price": "BDT {:,.2f}",
+                            "Audited P/E": "{:.2f}x",
+                            "Basic EPS": "BDT {:,.2f}",
+                        },
+                        na_rep="N/A",
+                    )
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.divider()
+    st.subheader("P/E Sensitivity")
+    if target_eps is not None and target_eps > 0:
+        sensitivity = build_pe_sensitivity_table(target_eps)
+        st.dataframe(
+            style_dark_dataframe(sensitivity.style.format({col: "BDT {:,.2f}" for col in sensitivity.columns if col != "EPS Case"})),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.divider()
+    st.subheader("Export")
+    export_cols = st.columns(2)
+    if valid_peers is not None:
+        export_cols[0].download_button(
+            "Peer valuation CSV",
+            data=valid_peers.to_csv(index=False).encode("utf-8"),
+            file_name=f"{target_company.ticker}_pe_valid_peers.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    if excluded_peers is not None:
+        export_cols[1].download_button(
+            "Excluded peers CSV",
+            data=excluded_peers.to_csv(index=False).encode("utf-8"),
+            file_name=f"{target_company.ticker}_pe_excluded_peers.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
+def render_pe_relative_valuation_page() -> None:
+    for key, default in {
+        "pe_target_company": None,
+        "pe_peer_options": [],
+        "pe_valid_peers": None,
+        "pe_excluded_peers": None,
+        "pe_peer_stats": None,
+        "pe_valuation": None,
+        "pe_target_eps": None,
+        "pe_target_price": None,
+        "pe_selected_multiple": None,
+        "pe_fetch_message": "",
+    }.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    input_col, output_col = st.columns([0.36, 0.64], gap="large")
+
+    with input_col:
+        with st.container(border=True):
+            st.markdown('<div class="panel-title">P/E Input Panel</div>', unsafe_allow_html=True)
+            target_ticker = st.text_input(
+                "Target DSE ticker",
+                value="GP",
+                help="Ticker is used in https://www.dsebd.org/displayCompany.php?name=(ticker)",
+            ).upper().strip()
+
+            if st.button("Fetch target company data", type="primary", use_container_width=True):
+                with st.spinner("Scraping target DSE company page..."):
+                    target_company = scrape_dse_company_data(target_ticker)
+                    st.session_state.pe_target_company = target_company
+                    st.session_state.pe_valid_peers = None
+                    st.session_state.pe_excluded_peers = None
+                    st.session_state.pe_peer_stats = None
+                    st.session_state.pe_valuation = None
+                if target_company.error:
+                    st.error(target_company.error)
+                else:
+                    st.success(f"Fetched {target_company.ticker} from DSE.")
+                    with st.spinner("Finding same-sector peers from DSE pages..."):
+                        peers = find_same_sector_peers(
+                            target_company.ticker,
+                            target_company.sector,
+                            max_scan=60,
+                        )
+                    st.session_state.pe_peer_options = peers
+                    st.session_state.pe_fetch_message = f"Fetched {target_company.ticker} from DSE."
+                    if len(peers) < 3:
+                        st.warning("Limited same-sector peers found. Add manual peer tickers if needed.")
+                    st.rerun()
+
+            if st.session_state.pe_fetch_message:
+                st.success(st.session_state.pe_fetch_message)
+
+            target_company: DSECompanyData | None = st.session_state.pe_target_company
+            default_eps = float(target_company.basic_eps or 0.0) if target_company else 0.0
+            default_price = float(target_company.last_traded_price or 0.0) if target_company else 0.0
+
+            st.divider()
+            st.subheader("Peer Selection")
+            if (
+                target_company is not None
+                and not target_company.error
+                and not st.session_state.pe_peer_options
+            ):
+                with st.spinner("Finding same-sector peers from DSE pages..."):
+                    st.session_state.pe_peer_options = find_same_sector_peers(
+                        target_company.ticker,
+                        target_company.sector,
+                        max_scan=60,
+                    )
+            peer_options = st.session_state.pe_peer_options or []
+            if target_company is not None and not target_company.error and len(peer_options) < 3:
+                st.warning("Limited same-sector peers found. Add manual peer tickers if needed.")
+            selected_peers = st.multiselect(
+                "Same-sector peer tickers",
+                options=peer_options,
+                default=peer_options[: min(8, len(peer_options))],
+                help="Select or remove peer companies manually before running valuation.",
+            )
+            manual_peer_text = st.text_input(
+                "Add manual peer tickers",
+                value="",
+                help="Comma-separated tickers, useful when the DSE sector peer scan is limited.",
+            )
+            manual_peers = [ticker.strip().upper() for ticker in manual_peer_text.split(",") if ticker.strip()]
+            final_peers = sorted(set(selected_peers + manual_peers))
+
+            st.divider()
+            st.subheader("Manual Overrides")
+            target_eps = st.number_input(
+                "Target EPS",
+                value=default_eps,
+                step=0.10,
+                format="%.3f",
+                help="Audited basic EPS continuing operations when available. Override for adjusted EPS.",
+            )
+            target_price = st.number_input(
+                "Target current market price",
+                min_value=0.0,
+                value=default_price,
+                step=1.0,
+                help="Last traded price from DSE when available. Override if needed.",
+            )
+            outlier_threshold = st.number_input(
+                "Outlier P/E threshold",
+                min_value=1.0,
+                value=80.0,
+                step=5.0,
+                help="Peers above this P/E are excluded as possible outliers.",
+            )
+            selected_multiple = st.selectbox(
+                "Valuation multiple",
+                ["Median P/E", "Average P/E", "Trimmed average P/E", "Custom P/E"],
+            )
+            custom_pe = st.number_input("Custom P/E multiple", min_value=0.0, value=12.0, step=0.5)
+
+            if st.button("Run relative valuation", type="primary", use_container_width=True):
+                if target_company is None or target_company.error:
+                    st.error("Fetch a valid target company first.")
+                elif not final_peers:
+                    st.error("Select at least one peer ticker.")
+                else:
+                    with st.spinner("Scraping selected peer companies and cleaning P/E data..."):
+                        peer_df = scrape_peer_company_data(final_peers)
+                        valid_peers, excluded_peers = clean_peer_pe_data(peer_df, outlier_threshold)
+                        peer_stats = calculate_peer_pe_statistics(valid_peers)
+                        valuation = run_relative_valuation(
+                            target_eps=target_eps,
+                            current_price=target_price,
+                            peer_stats=peer_stats,
+                            selected_multiple=selected_multiple,
+                            custom_pe=custom_pe,
+                        )
+                    st.session_state.pe_valid_peers = valid_peers
+                    st.session_state.pe_excluded_peers = excluded_peers
+                    st.session_state.pe_peer_stats = peer_stats
+                    st.session_state.pe_valuation = valuation
+                    st.session_state.pe_target_eps = target_eps
+                    st.session_state.pe_target_price = target_price
+                    st.session_state.pe_selected_multiple = selected_multiple
+
+    with output_col:
+        with st.container(border=True):
+            render_relative_valuation_dashboard(
+                target_company=st.session_state.pe_target_company,
+                valid_peers=st.session_state.pe_valid_peers,
+                excluded_peers=st.session_state.pe_excluded_peers,
+                peer_stats=st.session_state.pe_peer_stats,
+                valuation=st.session_state.pe_valuation,
+                target_eps=st.session_state.pe_target_eps,
+                target_price=st.session_state.pe_target_price,
+                selected_multiple=st.session_state.pe_selected_multiple,
+            )
+            with st.expander("P/E relative valuation notes"):
+                st.markdown(
+                    """
+                    Relative valuation does not estimate intrinsic value directly. It estimates what a
+                    company may be worth if valued similarly to comparable companies. The output depends
+                    heavily on peer selection and scraped data quality.
+
+                    P/E can be misleading for loss-making companies, cyclical firms, banks and financials,
+                    firms with unusually low EPS, or companies with one-time gains/losses. Always review
+                    the peer group and EPS quality before relying on the result.
+                    """
+                )
+
+
+def render_sidebar_navigation() -> str:
+    with st.sidebar:
+        st.markdown(
+            """
+            <div class="nav-brand">
+                <div class="nav-kicker">DSE Insight</div>
+                <div class="nav-title">Valuation Dashboard</div>
+                <div class="nav-subtitle">Switch between intrinsic-growth analysis and market-relative multiples.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        page = st.radio(
+            "Valuation Pages",
+            ["Reverse DCF", "P/E Relative Valuation"],
+            label_visibility="collapsed",
+        )
+        st.markdown(
+            """
+            <div class="nav-note">
+                Reverse DCF solves the growth priced into the market. P/E valuation compares the target
+                against selected DSE peers.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    return page
+
+
+def main() -> None:
+    st.set_page_config(page_title="DSE Insight", layout="wide")
+    inject_custom_css()
+    page = render_sidebar_navigation()
+    if page == "Reverse DCF":
+        render_page_header(
+            "Dhaka Stock Exchange Reverse DCF",
+            "Estimate the free-cash-flow growth rate already implied by a DSE-listed company's market price.",
+        )
+        render_reverse_dcf_page()
+    else:
+        render_page_header(
+            "DSE P/E Relative Valuation",
+            "Scrape official DSE company pages, compare selected peer P/E multiples, and estimate market-relative fair value.",
+        )
+        render_pe_relative_valuation_page()
 
 
 if __name__ == "__main__":
