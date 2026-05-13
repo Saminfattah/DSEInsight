@@ -27,5 +27,3 @@ Beginner-friendly structure for finance students and analysts
 
 # Purpose
 The main purpose of this project is to make equity valuation more accessible for DSE-listed companies by combining automated data collection, manual financial assumptions, and interactive valuation models in one simple dashboard. It helps users understand what growth expectations are implied in a stock’s current price and how the stock compares with similar companies based on market valuation multiples.
-
-Link: https://dseinsight.streamlit.app/
