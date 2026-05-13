@@ -2446,13 +2446,13 @@ def main() -> None:
     page = render_sidebar_navigation()
     if page == "Reverse DCF":
         render_page_header(
-            "Dhaka Stock Exchange Reverse DCF",
+            "Dhaka Stock Exchange Reverse DCF Model",
             "Estimate the free-cash-flow growth rate already implied by a DSE-listed company's market price.",
         )
         render_reverse_dcf_page()
     else:
         render_page_header(
-            "Dhaka Stock Exchange P/E Relative Valuation",
+            "Dhaka Stock Exchange P/E Relative Valuation Model",
             "Scrape official DSE company pages, compare selected peer P/E multiples, and estimate market-relative fair value.",
         )
         render_pe_relative_valuation_page()
